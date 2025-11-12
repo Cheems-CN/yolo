@@ -62,7 +62,7 @@ def preprocess_image(image_path, img_size=640):
     return image_tensor, orig_img, scale
 
 
-def postprocess_predictions(predictions, conf_threshold=0.25, iou_threshold=0.45):
+def postprocess_predictions(predictions, conf_threshold=0.25, iou_threshold=0.45, img_size=640):
     """
     后处理预测结果
     Post-process predictions
@@ -71,24 +71,27 @@ def postprocess_predictions(predictions, conf_threshold=0.25, iou_threshold=0.45
         predictions: 模型输出 / Model output [1, 4+num_classes, num_anchors]
         conf_threshold: 置信度阈值 / Confidence threshold
         iou_threshold: NMS的IoU阈值 / IoU threshold for NMS
+        img_size: 输入图片尺寸 / Input image size
     
     Returns:
         detections: 检测结果列表 / List of detections [x, y, w, h, conf, class_id]
     """
-    # predictions shape: [1, 4+num_classes, 8400]
-    # 转置为 [1, 8400, 4+num_classes]
-    # Transpose to [1, 8400, 4+num_classes]
+    # predictions shape: [1, 4+num_classes, num_anchors]
+    # 转置为 [1, num_anchors, 4+num_classes]
+    # Transpose to [1, num_anchors, 4+num_classes]
     predictions = predictions.permute(0, 2, 1)
     
     batch_size = predictions.shape[0]
     detections = []
     
     for i in range(batch_size):
-        pred = predictions[i]  # [8400, 4+num_classes]
+        pred = predictions[i]  # [num_anchors, 4+num_classes]
         
         # 分离boxes和scores / Separate boxes and scores
-        boxes = pred[:, :4]  # [8400, 4] - (x, y, w, h)
-        scores = pred[:, 4:]  # [8400, num_classes]
+        # 注意：boxes已经是pixel坐标的XYWH格式 (相对于img_size)
+        # Note: boxes are already in pixel coordinate XYWH format (relative to img_size)
+        boxes = pred[:, :4]  # [num_anchors, 4] - (x_center, y_center, w, h) in pixels
+        scores = pred[:, 4:]  # [num_anchors, num_classes]
         
         # 获取每个anchor的最大类别分数和索引
         # Get max class score and index for each anchor
@@ -104,26 +107,35 @@ def postprocess_predictions(predictions, conf_threshold=0.25, iou_threshold=0.45
         filtered_scores = class_scores[mask]
         filtered_classes = class_ids[mask]
         
-        # 简单的NMS (可以使用torchvision.ops.nms来优化)
-        # Simple NMS (can use torchvision.ops.nms for optimization)
-        keep_indices = []
-        indices = torch.argsort(filtered_scores, descending=True)
-        
-        while len(indices) > 0:
-            current = indices[0]
-            keep_indices.append(current)
+        # 使用torchvision的NMS (如果可用) 或简单NMS
+        # Use torchvision NMS (if available) or simple NMS
+        try:
+            import torchvision
+            # 转换XYWH到XYXY用于NMS
+            boxes_xyxy = xywh2xyxy(filtered_boxes)
+            keep_indices = torchvision.ops.nms(boxes_xyxy, filtered_scores, iou_threshold)
+            keep_indices = keep_indices.tolist()
+        except:
+            # 简单的NMS (可以使用torchvision.ops.nms来优化)
+            # Simple NMS (can use torchvision.ops.nms for optimization)
+            keep_indices = []
+            indices = torch.argsort(filtered_scores, descending=True)
             
-            if len(indices) == 1:
-                break
-            
-            current_box = filtered_boxes[current]
-            other_boxes = filtered_boxes[indices[1:]]
-            
-            # 计算IoU / Calculate IoU
-            ious = box_iou_simple(current_box.unsqueeze(0), other_boxes)
-            
-            # 保留IoU小于阈值的boxes / Keep boxes with IoU less than threshold
-            indices = indices[1:][ious[0] < iou_threshold]
+            while len(indices) > 0:
+                current = indices[0]
+                keep_indices.append(current.item())
+                
+                if len(indices) == 1:
+                    break
+                
+                current_box = filtered_boxes[current]
+                other_boxes = filtered_boxes[indices[1:]]
+                
+                # 计算IoU / Calculate IoU
+                ious = box_iou_simple(current_box.unsqueeze(0), other_boxes)
+                
+                # 保留IoU小于阈值的boxes / Keep boxes with IoU less than threshold
+                indices = indices[1:][ious[0] < iou_threshold]
         
         # 收集检测结果 / Collect detection results
         for idx in keep_indices:
@@ -133,6 +145,16 @@ def postprocess_predictions(predictions, conf_threshold=0.25, iou_threshold=0.45
             detections.append([x, y, w, h, conf, cls_id])
     
     return detections
+
+
+def xywh2xyxy(boxes):
+    """转换XYWH到XYXY格式 / Convert XYWH to XYXY format"""
+    xyxy = boxes.clone()
+    xyxy[:, 0] = boxes[:, 0] - boxes[:, 2] / 2  # x1
+    xyxy[:, 1] = boxes[:, 1] - boxes[:, 3] / 2  # y1
+    xyxy[:, 2] = boxes[:, 0] + boxes[:, 2] / 2  # x2
+    xyxy[:, 3] = boxes[:, 1] + boxes[:, 3] / 2  # y2
+    return xyxy
 
 
 def box_iou_simple(box1, boxes2):
@@ -174,7 +196,7 @@ def box_iou_simple(box1, boxes2):
     return ious.unsqueeze(0)
 
 
-def visualize_detections(image, detections, scale, class_names=None, save_path=None):
+def visualize_detections(image, detections, scale, class_names=None, save_path=None, img_size=640):
     """
     可视化检测结果
     Visualize detection results
@@ -182,9 +204,10 @@ def visualize_detections(image, detections, scale, class_names=None, save_path=N
     Args:
         image: 原始图片 / Original image
         detections: 检测结果 / Detection results
-        scale: 缩放比例 / Scale ratio
+        scale: 缩放比例 / Scale ratio (original_size / img_size)
         class_names: 类别名称列表 / List of class names
         save_path: 保存路径 / Save path
+        img_size: 模型输入尺寸 / Model input size
     """
     fig, ax = plt.subplots(1, figsize=(12, 9))
     ax.imshow(image)
@@ -192,7 +215,9 @@ def visualize_detections(image, detections, scale, class_names=None, save_path=N
     for det in detections:
         x, y, w, h, conf, cls_id = det
         
-        # 转换回原始图片尺寸 / Convert back to original image size
+        # 注意：x, y, w, h 是相对于img_size的像素坐标
+        # Note: x, y, w, h are pixel coordinates relative to img_size
+        # 需要转换回原始图片尺寸 / Need to convert back to original image size
         x_orig = x * scale[0]
         y_orig = y * scale[1]
         w_orig = w * scale[0]
@@ -239,7 +264,7 @@ def main():
     model_path = "yolov11_final.pth"  # 模型权重路径 / Path to model weights
     image_path = "test_image.png"     # 测试图片路径 / Path to test image
     num_classes = 7                    # 类别数量 / Number of classes
-    img_size = 640                     # 图片大小 / Image size
+    img_size = 640                     # 图片大小 / Image size (应与训练时一致 / Should match training)
     conf_threshold = 0.25              # 置信度阈值 / Confidence threshold
     iou_threshold = 0.45               # NMS IoU阈值 / NMS IoU threshold
     
@@ -280,10 +305,25 @@ def main():
     detections = postprocess_predictions(
         predictions.cpu(),
         conf_threshold=conf_threshold,
-        iou_threshold=iou_threshold
+        iou_threshold=iou_threshold,
+        img_size=img_size
     )
     
     print(f"检测到 {len(detections)} 个目标 / Detected {len(detections)} objects")
+    
+    # 检查是否所有框都是零 / Check if all boxes are zero
+    if len(detections) > 0:
+        all_zero = all(det[0] == 0 and det[1] == 0 and det[2] == 0 and det[3] == 0 for det in detections)
+        if all_zero:
+            print("\n⚠️  警告 / WARNING: 所有边界框坐标为0！/ All bounding box coordinates are 0!")
+            print("   可能原因 / Possible reasons:")
+            print("   1. 模型未训练或权重未正确加载 / Model is untrained or weights not loaded correctly")
+            print("   2. 训练时使用的img_size与当前不一致 / img_size used during training differs from current")
+            print("   3. 模型的stride未正确初始化 / Model stride not properly initialized")
+            print("   建议 / Suggestions:")
+            print("   - 确认模型已完成训练 / Confirm model is trained")
+            print("   - 检查img_size是否与训练时一致 / Check if img_size matches training")
+            print("   - 尝试重新训练或加载正确的权重 / Try retraining or loading correct weights\n")
     
     # 打印检测结果 / Print detection results
     for i, det in enumerate(detections):
@@ -302,7 +342,8 @@ def main():
         detections,
         scale,
         class_names=class_names,
-        save_path=save_path
+        save_path=save_path,
+        img_size=img_size
     )
     
     print("\n推理完成！/ Inference complete!")
