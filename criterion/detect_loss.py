@@ -464,7 +464,8 @@ class YoloV11DetectionLoss:
         target_scores_sum = max(target_scores.sum(), torch.tensor(1.0, device=device))
 
         # Classification loss (BCE)
-        cls_loss = self.bce(pred_scores, target_scores.to(pred_scores.dtype)).sum() / target_scores_sum
+        # Normalize by batch size and number of anchors to avoid explosion
+        cls_loss = self.bce(pred_scores, target_scores.to(pred_scores.dtype)).sum() / (B * pred_scores.shape[1])
 
         # Bbox + DFL
         box_loss = pred_scores.sum() * 0.0
