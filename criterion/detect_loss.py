@@ -7,8 +7,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
-from components.modules.head import dist2bbox, make_anchors
+# Handle imports for both package and direct execution
+try:
+    from ..modules.head import dist2bbox, make_anchors
+except (ImportError, ValueError):
+    import sys
+    import os
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from modules.head import dist2bbox, make_anchors
 
 
 # --------------------------
@@ -243,8 +249,8 @@ class TaskAlignedAssigner(nn.Module):
         target_scores = torch.zeros((self.bs, target_labels.shape[1], self.num_classes),
                                     dtype=torch.float32, device=gt_labels.device)
         target_scores.scatter_(2, target_labels.unsqueeze(-1), 1.0)
-        # Mask out background anchors
-        fg_scores_mask = fg_mask[:, :, None].repeat(1, 1, self.num_classes)
+        # Mask out background anchors (fg_mask might be float, convert to bool)
+        fg_scores_mask = (fg_mask > 0)[:, :, None].repeat(1, 1, self.num_classes)
         target_scores = torch.where(fg_scores_mask, target_scores, torch.zeros_like(target_scores))
         return target_labels, target_bboxes, target_scores
 
@@ -279,7 +285,10 @@ class TaskAlignedAssigner(nn.Module):
         align_metric = bbox_scores.pow(self.alpha) * overlaps.pow(self.beta)
 
         # candidate mask: centers within gt box
-        mask_in_gts = self.select_candidates_in_gts(anc_points, gt_bboxes) & mask_gt
+        mask_in_gts = self.select_candidates_in_gts(anc_points, gt_bboxes)  # (B,M,A) bool
+        # Broadcast mask_gt from (B,M,1) to (B,M,A) and combine
+        mask_gt_expanded = mask_gt.expand(-1, -1, mask_in_gts.shape[-1]).bool()
+        mask_in_gts = mask_in_gts.bool() & mask_gt_expanded
         # select top-k anchors per-gt
         topk_mask = self.select_topk_candidates(align_metric)
         mask_pos = topk_mask & mask_in_gts
@@ -310,17 +319,19 @@ class TaskAlignedAssigner(nn.Module):
     def select_highest_overlaps(mask_pos: torch.Tensor, overlaps: torch.Tensor, n_max_boxes: int):
         # Resolve multiple gts assigned to same anchor: keep the gt with max IoU
         B, M, A = mask_pos.shape
-        fg_mask = mask_pos.sum(dim=1)  # (B, A)
+        # Convert to float for sum/argmax operations
+        mask_pos_float = mask_pos.float()
+        fg_mask = mask_pos_float.sum(dim=1)  # (B, A)
         if fg_mask.max() > 1:
             max_overlaps_idx = overlaps.argmax(dim=1)  # (B, A)
-            is_max = torch.zeros_like(mask_pos, dtype=mask_pos.dtype)
+            is_max = torch.zeros_like(mask_pos_float)
             br = torch.arange(B, device=mask_pos.device)[:, None]
             ar = torch.arange(A, device=mask_pos.device)[None, :]
             is_max[br, max_overlaps_idx, ar] = 1
-            mask_pos = is_max
-            fg_mask = mask_pos.sum(dim=1)
-        target_gt_idx = mask_pos.argmax(dim=1)
-        return target_gt_idx, fg_mask, mask_pos
+            mask_pos_float = is_max
+            fg_mask = mask_pos_float.sum(dim=1)
+        target_gt_idx = mask_pos_float.argmax(dim=1)
+        return target_gt_idx, fg_mask, mask_pos_float
 
 
 class YoloV11DetectionLoss:
@@ -379,8 +390,8 @@ class YoloV11DetectionLoss:
         # pred_dist: (B, A, 4*reg_max) raw logits -> softmax over reg_max bins, expectation -> distances
         B, A, C = pred_dist.shape
         if self.reg_max > 1:
-            pred = pred_dist.view(B, A, 4, self.reg_max).softmax(dim=-1).matmul(self.proj.type(pred_dist.dtype).view(1, 1, 1, -1))
-            pred = pred.squeeze(-2)  # (B, A, 4)
+            # Reshape to (B, A, 4, reg_max), softmax over reg_max, and compute weighted sum
+            pred = pred_dist.view(B, A, 4, self.reg_max).softmax(dim=-1) @ self.proj.type(pred_dist.dtype)
         else:
             pred = pred_dist.view(B, A, 4)
         return dist2bbox(pred, anchor_points, xywh=False)  # xyxy in grid units
@@ -453,7 +464,8 @@ class YoloV11DetectionLoss:
         target_scores_sum = max(target_scores.sum(), torch.tensor(1.0, device=device))
 
         # Classification loss (BCE)
-        cls_loss = self.bce(pred_scores, target_scores.to(pred_scores.dtype)).sum() / target_scores_sum
+        # Normalize by batch size and number of anchors to avoid explosion
+        cls_loss = self.bce(pred_scores, target_scores.to(pred_scores.dtype)).sum() / (B * pred_scores.shape[1])
 
         # Bbox + DFL
         box_loss = pred_scores.sum() * 0.0
